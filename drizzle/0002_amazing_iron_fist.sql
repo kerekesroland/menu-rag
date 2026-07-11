@@ -1,0 +1,1 @@
+CREATE TYPE "public"."menu_category" AS ENUM('DIET', 'SPORT', 'NORMAL', 'KIDS', 'SOUP');
