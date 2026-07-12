@@ -16,16 +16,11 @@ export class EmbeddingService {
   }
 
   async embedContent(content: string[]): Promise<number[][]> {
-    // free tier: 3 requests/min and 10K tokens/min — 128 nutrition-rich
-    // descriptions blow the token cap in a single request, so keep batches
-    // small and pace them a minute apart
-    const BATCH = 64;
-    const BATCH_DELAY_MS = 60_000;
+    // Voyage caps a request at 1000 texts / 320K tokens — 128 keeps us
+    // comfortably inside both
+    const BATCH = 128;
     const out: number[][] = [];
     for (let i = 0; i < content.length; i += BATCH) {
-      if (i > 0) {
-        await new Promise((r) => setTimeout(r, BATCH_DELAY_MS));
-      }
       const res = await this.embedWithRetry(content.slice(i, i + BATCH));
       if (res?.data) out.push(...res.data.map((el) => el.embedding!));
     }

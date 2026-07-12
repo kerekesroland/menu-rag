@@ -36,7 +36,7 @@ export class RagService {
       .from(menuItems)
       .where(gt(similarity, 0.4))
       .orderBy(desc(similarity))
-      .limit(8);
+      .limit(30);
 
     if (hits.length === 0) {
       return 'Sajnos nem találtam ilyet a heti menüben.';
