@@ -1,13 +1,43 @@
 import { Injectable } from '@nestjs/common';
 import { chromium, Page } from 'playwright';
 
+export interface ScrapedNutrition {
+  energyKcal: string | null;
+  fatG: string | null;
+  saturatedFatG: string | null;
+  carbsG: string | null;
+  sugarG: string | null;
+  proteinG: string | null;
+  saltG: string | null;
+}
+
 export interface ScrapedMenuItem {
   externalId: string;
   name: string;
   description: string | null;
   category: string;
   price: string | null;
+  // raw allergen phrases as printed on the site, e.g. "tejet", "glutént"
+  allergens: string[];
+  nutrition: ScrapedNutrition;
 }
+
+interface FoodDetails {
+  // ingredients + net weight — stays in the description that gets embedded
+  text: string;
+  allergens: string[];
+  nutritionRows: { label: string; value: string }[];
+}
+
+const EMPTY_NUTRITION: ScrapedNutrition = {
+  energyKcal: null,
+  fatG: null,
+  saturatedFatG: null,
+  carbsG: null,
+  sugarG: null,
+  proteinG: null,
+  saltG: null,
+};
 
 @Injectable()
 export class EfoodScraperService {
@@ -29,7 +59,7 @@ export class EfoodScraperService {
       });
 
       const items = await page.evaluate(() => {
-        const results: ScrapedMenuItem[] = [];
+        const results: Omit<ScrapedMenuItem, 'allergens' | 'nutrition'>[] = [];
 
         // the week's days in order — a .category holds one .food per day,
         // in the same order as these buttons
@@ -97,12 +127,16 @@ export class EfoodScraperService {
       return items.map((item) => {
         const details = detailsById.get(item.externalId);
         if (!details) {
-          return item;
+          return { ...item, allergens: [], nutrition: EMPTY_NUTRITION };
         }
         const base = item.description ? `${item.description}\n` : '';
         return {
           ...item,
-          description: `${base}${details}`,
+          description: details.text
+            ? `${base}${details.text}`
+            : item.description,
+          allergens: details.allergens,
+          nutrition: this.parseNutrition(details.nutritionRows),
         };
       });
     } finally {
@@ -112,8 +146,10 @@ export class EfoodScraperService {
 
   // Ingredients, allergens and the nutrition table only enter the DOM while
   // hovering the "részletei" info button, so they are read one food at a time.
-  private async scrapeFoodDetails(page: Page): Promise<Map<string, string>> {
-    const detailsById = new Map<string, string>();
+  private async scrapeFoodDetails(
+    page: Page,
+  ): Promise<Map<string, FoodDetails>> {
+    const detailsById = new Map<string, FoodDetails>();
     const foods = page.locator('.food');
     const count = await foods.count();
 
@@ -138,13 +174,14 @@ export class EfoodScraperService {
         const tooltip = page.locator('.tooltip-inner-text').last();
         await tooltip.waitFor({ state: 'visible', timeout: 3000 });
 
-        const details = await tooltip.evaluate((root) => {
+        const details = await tooltip.evaluate((root): FoodDetails => {
           const parts: string[] = [];
+          const allergens: string[] = [];
+          const nutritionRows: { label: string; value: string }[] = [];
           const children = Array.from(root.children);
 
           for (const child of children) {
             if (child.tagName === 'TABLE') {
-              const rows: string[] = [];
               child.querySelectorAll('tbody tr').forEach((tr) => {
                 const cells = tr.querySelectorAll('td');
                 if (cells.length < 2) {
@@ -155,12 +192,9 @@ export class EfoodScraperService {
                   .trim();
                 const value = cells[1].textContent?.trim();
                 if (label && value) {
-                  rows.push(`${label}: ${value}`);
+                  nutritionRows.push({ label, value });
                 }
               });
-              if (rows.length) {
-                parts.push(`Tápértékek (1 adag): ${rows.join(', ')}`);
-              }
             } else if (child.tagName === 'P' && child !== children[0]) {
               // children[0] is the dish name, already scraped from the card
               const text = child.textContent?.replace(/\u00a0/g, ' ').trim();
@@ -173,19 +207,19 @@ export class EfoodScraperService {
               }
               parts.push(`Összetevők: ${text}`);
               // allergens are the bold spans within the ingredient list
-              const allergens = Array.from(child.querySelectorAll('b'))
-                .map((b) => b.textContent?.replace(/[,\s]+$/, '').trim())
-                .filter(Boolean);
-              if (allergens.length) {
-                parts.push(`Allergének: ${allergens.join(', ')}`);
-              }
+              child.querySelectorAll('b').forEach((b) => {
+                const allergen = b.textContent?.replace(/[,\s]+$/, '').trim();
+                if (allergen) {
+                  allergens.push(allergen);
+                }
+              });
             }
           }
 
-          return parts.join('\n');
+          return { text: parts.join('\n'), allergens, nutritionRows };
         });
 
-        if (details) {
+        if (details.text || details.allergens.length) {
           detailsById.set(externalId, details);
         }
       } catch {
@@ -202,5 +236,39 @@ export class EfoodScraperService {
     }
 
     return detailsById;
+  }
+
+  // Maps the tooltip's nutrition rows (e.g. "Energia: 450 kcal / 1880 kJ",
+  // "amelyből cukrok: 4,2 g") onto the typed columns. Unknown labels are
+  // ignored; order matters where one label is a substring of another.
+  private parseNutrition(
+    rows: { label: string; value: string }[],
+  ): ScrapedNutrition {
+    const nutrition: ScrapedNutrition = { ...EMPTY_NUTRITION };
+
+    const LABELS: [RegExp, keyof ScrapedNutrition][] = [
+      [/energia/i, 'energyKcal'],
+      [/telített/i, 'saturatedFatG'],
+      [/zsír/i, 'fatG'],
+      [/cukr/i, 'sugarG'],
+      [/szénhidrát/i, 'carbsG'],
+      [/fehérje/i, 'proteinG'],
+      [/só/i, 'saltG'],
+    ];
+
+    for (const { label, value } of rows) {
+      const key = LABELS.find(([re]) => re.test(label))?.[1];
+      if (!key || nutrition[key] !== null) {
+        continue;
+      }
+      // energy rows often list kJ and kcal — prefer the kcal figure
+      const kcal = value.match(/(\d+(?:[.,]\d+)?)\s*kcal/i);
+      const num = kcal?.[1] ?? value.match(/\d+(?:[.,]\d+)?/)?.[0];
+      if (num) {
+        nutrition[key] = num.replace(',', '.');
+      }
+    }
+
+    return nutrition;
   }
 }
